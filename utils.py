@@ -1,3 +1,15 @@
+"""
+Utility Functions Module.
+
+This module provides common utility functions for the application, including:
+- Tool and agent discovery and loading
+- Module loading utilities
+- Checkpoint management for stateful operations
+
+The utilities here are used across the application to dynamically discover
+available tools and agents, handle module loading, and manage application state.
+"""
+
 import sqlite3
 import importlib.util
 import sys
@@ -11,6 +23,15 @@ conn = sqlite3.connect("checkpoints.sqlite", check_same_thread=False)
 checkpointer = SqliteSaver(conn)
 
 def all_tool_functions():
+    """
+    Get all available tool functions from the tools directory.
+    
+    This function loads each tool module and extracts the tool function.
+    It handles errors gracefully, logging when a tool cannot be loaded.
+    
+    Returns:
+        List of callable tool functions that can be used by agents
+    """
     tools = list_tools()
     tool_funcs = []
     
@@ -25,6 +46,15 @@ def all_tool_functions():
     return tool_funcs
 
 def list_broken_tools():
+    """
+    Find and report tools that have errors when loaded.
+    
+    This function attempts to load each tool and captures any exceptions,
+    helping identify which tools are broken and why.
+    
+    Returns:
+        Dict mapping tool names to their errors and exception traces
+    """
     tools = list_tools()
     broken_tools = {}
     
@@ -41,9 +71,13 @@ def list_broken_tools():
 
 def list_tools():
     """
-    list all tools available in the tools directory
-
-    :return: list of tools
+    List all tools available in the tools directory.
+    
+    This function scans the tools directory for Python files,
+    each representing a tool that can be loaded.
+    
+    Returns:
+        List of tool names (without the .py extension)
     """
     import os
     tools = []
