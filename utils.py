@@ -19,6 +19,7 @@ import traceback
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 
+# Initialize SQLite connection for checkpoints
 conn = sqlite3.connect("checkpoints.sqlite", check_same_thread=False)
 checkpointer = SqliteSaver(conn)
 
@@ -88,6 +89,19 @@ def list_tools():
     return tools
 
 def all_agents(exclude=["hermes"]):
+    """
+    Get all available agents with their descriptions.
+    
+    This function loads each agent module and extracts its docstring description.
+    It handles errors gracefully, logging when an agent cannot be loaded.
+    The 'hermes' agent is excluded by default as it's a system agent.
+    
+    Args:
+        exclude: List of agent names to exclude from the results
+        
+    Returns:
+        Dict mapping agent names to their docstring descriptions
+    """
     agents = list_agents()
     agents = [agent for agent in agents if agent not in exclude]
     agent_funcs = {}
@@ -104,6 +118,15 @@ def all_agents(exclude=["hermes"]):
     return agent_funcs
 
 def list_broken_agents():
+    """
+    Find and report agents that have errors when loaded.
+    
+    This function attempts to load each agent and captures any exceptions,
+    helping identify which agents are broken and why.
+    
+    Returns:
+        Dict mapping agent names to their errors and exception traces
+    """
     agents = list_agents()
     broken_agents = {}
     
@@ -120,9 +143,14 @@ def list_broken_agents():
 
 def list_agents():
     """
-    list all agents available in the agents directory
-
-    :return: list of agents
+    List all agents available in the agents directory.
+    
+    This function scans the agents directory for Python files,
+    each representing an agent that can be loaded.
+    It excludes __init__.py files.
+    
+    Returns:
+        List of agent names (without the .py extension)
     """
     import os
     agents = []
@@ -134,10 +162,21 @@ def list_agents():
 
 def gensym(length=32, prefix="gensym_"):
     """
-    generates a fairly unique symbol, used to make a module name,
-    used as a helper function for load_module
-
-    :return: generated symbol
+    Generate a unique symbol for use as a module name.
+    
+    This function creates a random alphanumeric string that can be used
+    as a unique module identifier when dynamically loading modules.
+    
+    Args:
+        length: Length of the random part of the symbol
+        prefix: Prefix to prepend to the random part
+        
+    Returns:
+        A string containing the prefix followed by random characters
+        
+    Example:
+        >>> gensym(8, "mod_")
+        'mod_A7bC3d9F'
     """
     alphabet = string.ascii_uppercase + string.ascii_lowercase + string.digits
     symbol = "".join([secrets.choice(alphabet) for i in range(length)])
@@ -146,13 +185,22 @@ def gensym(length=32, prefix="gensym_"):
 
 def load_module(source, module_name=None):
     """
-    reads file source and loads it as a module
-
-    :param source: file to load
-    :param module_name: name of module to register in sys.modules
-    :return: loaded module
+    Dynamically load a Python file as a module.
+    
+    This function loads a Python file from disk and imports it as a module
+    into the current Python process. It's used for dynamic loading of
+    tools and agents.
+    
+    Args:
+        source: Path to the Python file to load
+        module_name: Name to give the module (generated if None)
+        
+    Returns:
+        The loaded module object
+        
+    Raises:
+        ImportError: If the module cannot be loaded
     """
-
     if module_name is None:
         module_name = gensym()
 
