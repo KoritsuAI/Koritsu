@@ -1,3 +1,9 @@
 #!/bin/bash
+#
+# Launch a bash shell inside the AgentK Docker container.
+# This provides a convenient way to access the container's environment 
+# for debugging or running commands directly.
+#
+# Usage: ./bash_shell
 
 docker compose run --rm --entrypoint bash agentk
