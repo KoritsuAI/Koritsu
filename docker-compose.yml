@@ -1,8 +1,17 @@
+# Docker Compose configuration for AgentK
+#
+# This file defines the AgentK service for development and production.
+# It mounts the local directory into the container for live code changes.
+
+version: "3.8" # Using Docker Compose version 3.8 schema
+
 services:
+  # Main AgentK service definition
   agentk:
-    build: ./
+    build: ./ # Build context is the current directory (using the Dockerfile)
     volumes:
-      - "./:/app"
+      - "./:/app" # Mount local directory for development
     env_file:
-      - .env
-    profiles: ["exclude-from-up"] # Do not up. Use `docker compose run --rm agentk` to get an attached container
+      - .env # Load environment variables from .env file
+    profiles: ["exclude-from-up"] # Do not start with 'docker compose up'
+    # Note: Use 'docker compose run --rm agentk' to run with an attached container
