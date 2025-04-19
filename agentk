@@ -1,3 +1,8 @@
 #!/bin/bash
+#
+# Main entry script for running the AgentK application in a Docker container.
+# This script provides a convenient shorthand for running the agent.
+#
+# Usage: ./agentk
 
 docker compose run --rm agentk
