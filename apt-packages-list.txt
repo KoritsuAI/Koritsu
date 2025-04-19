@@ -1,7 +1,17 @@
+# System packages required for AgentK
+# This file is used by the Dockerfile to install dependencies
+#
+# Network utilities
 wget
 curl
 git
+
+# Web automation
 chromium-driver
+
+# SSL certificates
 ca-certificates
+
+# Rust/C++ build dependencies (needed for some Python packages)
 cmake
 libclang-dev
