@@ -1,10 +1,19 @@
-langgraph==0.2.0
-langchain-community==0.2.11
-langgraph-checkpoint==1.0.1
-langchain-openai
-langchain-anthropic
-langgraph-checkpoint-sqlite
-selenium
-unstructured
-duckduckgo-search
-python-dotenv
+# Python dependencies for AgentK application
+#
+# Core LangGraph and LangChain components
+langgraph==0.2.0                # Framework for building stateful agent workflows
+langchain-community==0.2.11     # Community integrations for LangChain
+langgraph-checkpoint==1.0.1     # Checkpointing for stateful agents
+langgraph-checkpoint-sqlite     # SQLite backend for checkpoints
+
+# LLM providers
+langchain-openai               # OpenAI model integrations
+langchain-anthropic            # Anthropic model integrations  
+
+# Web interaction tools
+selenium                       # Browser automation for web scraping
+duckduckgo-search              # DuckDuckGo search API client
+unstructured                   # Text extraction from various formats
+
+# Utilities
+python-dotenv                  # Environment variable management
