@@ -1,7 +1,19 @@
-checkpoints.sqlite*
-__pycache__
-.env
-tmp
-_scratch.py
+# Git ignore patterns for AgentK
+#
+# Application data and state files
+checkpoints.sqlite*          # Agent checkpoint databases
+.env                         # Environment variables (contains secrets)
 
-venv/
+# Temporary files and directories
+tmp                          # Temporary directory
+_scratch.py                  # Scratch/test file
+
+# Python artifacts
+__pycache__                  # Python bytecode cache
+venv/                        # Virtual environment
+
+# Editor and OS specific files
+.DS_Store                    # macOS folder attributes
+.vscode/                     # VS Code settings
+*.swp                        # Vim swap files
+*~                           # Backup files
