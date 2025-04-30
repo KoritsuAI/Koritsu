@@ -1,0 +1,36 @@
+version: "3.8"
+
+services:
+  condor-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: condor-server
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./:/app
+    environment:
+      - CONDOR_MODEL_SIZE=40b # Options: "7b" or "40b"
+      - CONDOR_PORT=8001
+      - CONDOR_HOST=0.0.0.0
+      - CONDOR_MAX_LENGTH=2048
+      - CONDOR_TEMPERATURE=0.7
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  huggingface_cache:
+    name: condor_huggingface_cache

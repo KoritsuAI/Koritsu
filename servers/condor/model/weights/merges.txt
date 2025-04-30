@@ -1,0 +1,19 @@
+#version: 0.2
+# This is a minimal example of BPE merges.
+# In a real tokenizer, this would contain thousands of merge rules.
+t h
+h e
+t he
+a n
+a nd
+i n
+o f
+i s
+t o
+w i
+w it
+w it h
+f o
+f or
+a s
+o n 
