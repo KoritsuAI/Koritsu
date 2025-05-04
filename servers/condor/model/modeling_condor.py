@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from .configuration_condor import CondorConfig
+from .moe import CondorMoELayer, MoEConfig
 
 
 def _make_causal_mask(input_ids_shape, dtype):
@@ -203,21 +204,19 @@ class CondorAttention(nn.Module):
 
 class CondorMLP(nn.Module):
     """
-    Multi-layer Perceptron for Condor model.
+    MLP for Condor model.
     """
+    
     def __init__(self, config):
         super().__init__()
-        hidden_size = config.hidden_size
-        
-        # Condor typically uses a 4x multiple for intermediate size
-        self.dense_h_to_4h = nn.Linear(hidden_size, 4 * hidden_size, bias=config.bias)
-        self.act = nn.GELU()
-        self.dense_4h_to_h = nn.Linear(4 * hidden_size, hidden_size, bias=config.bias)
+        self.dense_in = nn.Linear(config.hidden_size, 4 * config.hidden_size, bias=config.bias)
+        self.dense_out = nn.Linear(4 * config.hidden_size, config.hidden_size, bias=config.bias)
+        self.act_fn = nn.GELU()
     
     def forward(self, x):
-        x = self.dense_h_to_4h(x)
-        x = self.act(x)
-        x = self.dense_4h_to_h(x)
+        x = self.dense_in(x)
+        x = self.act_fn(x)
+        x = self.dense_out(x)
         return x
 
 
@@ -225,23 +224,40 @@ class CondorDecoderLayer(nn.Module):
     """
     Decoder layer for Condor model.
     """
-    def __init__(self, config):
+    
+    def __init__(self, config, layer_idx=None):
         super().__init__()
         self.config = config
+        self.layer_idx = layer_idx
+        
         self.hidden_size = config.hidden_size
+        self.self_attn = CondorAttention(config)
         
-        # LayerNorm
-        self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        # Determine if this layer should use MoE
+        self.use_moe = (
+            config.use_moe and 
+            layer_idx is not None and 
+            layer_idx % config.moe_layer_frequency == 0
+        )
         
-        # Self-attention
-        self.self_attention = CondorAttention(config)
+        if self.use_moe:
+            # Initialize MoE layer
+            self.moe = CondorMoELayer(
+                config, 
+                config.moe_config, 
+                config.hidden_size, 
+                4 * config.hidden_size
+            )
+        else:
+            # Standard MLP 
+            self.mlp = CondorMLP(config)
         
-        # Fully-connected feed-forward network
-        self.mlp = CondorMLP(config)
+        # Layer normalization
+        self.ln_1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         
-        # For older Condor variants, we have two LayerNorms
+        # Only use a second layer norm if not using parallel attention
         if not config.parallel_attn:
-            self.post_attention_layernorm = nn.LayerNorm(self.hidden_size, eps=config.layer_norm_epsilon)
+            self.ln_2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
     
     def forward(
         self,
@@ -249,17 +265,18 @@ class CondorDecoderLayer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        training: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]], Optional[Dict[str, torch.Tensor]]]:
         """
         Forward pass for the decoder layer.
         """
         residual = hidden_states
         
-        # Apply layernorm (input)
-        hidden_states = self.input_layernorm(hidden_states)
+        # Apply layer normalization before self-attention
+        hidden_states = self.ln_1(hidden_states)
         
-        # Apply self-attention
-        attention_output, present = self.self_attention(
+        # Self-attention
+        attn_outputs, present = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             layer_past=layer_past,
@@ -267,35 +284,51 @@ class CondorDecoderLayer(nn.Module):
         )
         
         if self.config.parallel_attn:
-            # Parallel attention and MLP
-            hidden_states = self.mlp(hidden_states)
-            hidden_states = residual + attention_output + hidden_states
+            # In parallel attention, we apply both self-attention and MLP/MoE to the same input
+            # Then we add both outputs to the residual
+            
+            # MoE or MLP branch
+            if self.use_moe:
+                moe_outputs, aux_loss_dict = self.moe(hidden_states, training=training)
+                hidden_states = residual + attn_outputs + moe_outputs
+                return hidden_states, present, aux_loss_dict
+            else:
+                mlp_outputs = self.mlp(hidden_states)
+                hidden_states = residual + attn_outputs + mlp_outputs
+                return hidden_states, present, None
         else:
-            # Sequential attention and MLP
-            hidden_states = residual + attention_output
+            # In sequential attention, we add the self-attention output to the residual
+            # Then apply another layer norm before the MLP/MoE
+            hidden_states = residual + attn_outputs
+            
             residual = hidden_states
-            hidden_states = self.post_attention_layernorm(hidden_states)
-            hidden_states = self.mlp(hidden_states)
-            hidden_states = residual + hidden_states
-        
-        return hidden_states, present
+            hidden_states = self.ln_2(hidden_states)
+            
+            # MoE or MLP branch
+            if self.use_moe:
+                moe_outputs, aux_loss_dict = self.moe(hidden_states, training=training)
+                hidden_states = residual + moe_outputs
+                return hidden_states, present, aux_loss_dict
+            else:
+                mlp_outputs = self.mlp(hidden_states)
+                hidden_states = residual + mlp_outputs
+                return hidden_states, present, None
 
 
 class CondorModel(nn.Module):
     """
-    Condor base model.
+    Base model for Condor.
     """
+    
     def __init__(self, config):
         super().__init__()
         self.config = config
         
-        # Word embeddings
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        
-        # Decoder layers
-        self.layers = nn.ModuleList([CondorDecoderLayer(config) for _ in range(config.num_hidden_layers)])
-        
-        # Final LayerNorm
+        self.layers = nn.ModuleList([
+            CondorDecoderLayer(config, layer_idx=i)
+            for i in range(config.num_hidden_layers)
+        ])
         self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         
         # Initialize weights
@@ -303,13 +336,14 @@ class CondorModel(nn.Module):
     
     def _init_weights(self, module):
         """Initialize the weights."""
-        if isinstance(module, (nn.Linear, nn.Embedding)):
+        if isinstance(module, nn.Linear):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if isinstance(module, nn.Linear) and module.bias is not None:
+            if module.bias is not None:
                 module.bias.data.zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
     
     def forward(
         self,
@@ -318,85 +352,122 @@ class CondorModel(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
+        training: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[List[Tuple[torch.Tensor, torch.Tensor]]], Optional[Dict[str, torch.Tensor]]]:
         """
-        Forward pass for the Condor model.
+        Forward pass for the model.
         """
         batch_size, seq_length = input_ids.shape
         
-        # Get embeddings
+        # Get token embeddings
         hidden_states = self.embed_tokens(input_ids)
         
-        # Create causal attention mask if none provided
+        # Create causal mask if attention mask is not provided
         if attention_mask is None:
             attention_mask = torch.ones((batch_size, seq_length), device=hidden_states.device)
         
-        # Convert 2D mask to 4D mask for attention
-        attention_mask_4d = _make_causal_mask(input_ids.shape, hidden_states.dtype).to(hidden_states.device)
-        if attention_mask is not None:
-            attention_mask_4d = attention_mask_4d + attention_mask.unsqueeze(1).unsqueeze(2).to(attention_mask_4d.dtype)
+        # Convert attention mask to format expected by the model
+        # This creates a mask of shape [batch_size, 1, seq_length, seq_length]
+        # with -inf values for positions that should not be attended to
+        extended_attention_mask = _make_causal_mask(
+            input_ids_shape=input_ids.shape,
+            dtype=hidden_states.dtype,
+        )
+        extended_attention_mask = extended_attention_mask.to(hidden_states.device)
         
-        # Initialize past key values if not provided
-        if past_key_values is None:
-            past_key_values = [None] * len(self.layers)
+        # If past_key_values are provided, only attend to the new tokens
+        if past_key_values is not None:
+            # past_length is the length of past tokens
+            past_length = past_key_values[0][0].size(2)
+            
+            # Only process the new tokens
+            extended_attention_mask = extended_attention_mask[:, :, -seq_length:, :]
+        else:
+            past_length = 0
         
-        # Output containers
-        presents = [] if use_cache else None
+        # Initialize present_key_values if use_cache is True
+        present_key_values = [] if use_cache else None
         
-        # Process through decoder layers
-        for i, (layer, layer_past) in enumerate(zip(self.layers, past_key_values)):
-            hidden_states, present = layer(
+        # Initialize dictionary to collect MoE auxiliary losses
+        all_aux_losses = {}
+        
+        # Process through each decoder layer
+        for idx, layer in enumerate(self.layers):
+            # Pass through the layer
+            # The past_key_values for this layer are at position idx
+            layer_past = past_key_values[idx] if past_key_values is not None else None
+            
+            layer_outputs = layer(
                 hidden_states=hidden_states,
-                attention_mask=attention_mask_4d,
+                attention_mask=extended_attention_mask,
                 layer_past=layer_past,
                 use_cache=use_cache,
+                training=training,
             )
             
+            # Unpack layer outputs
+            if len(layer_outputs) == 3:
+                hidden_states, present, aux_losses = layer_outputs
+            else:
+                hidden_states, present = layer_outputs
+                aux_losses = None
+            
+            # Collect present key values for caching
             if use_cache:
-                presents.append(present)
+                present_key_values.append(present)
+            
+            # Collect auxiliary losses if any
+            if aux_losses is not None:
+                for loss_name, loss_value in aux_losses.items():
+                    if loss_name in all_aux_losses:
+                        all_aux_losses[loss_name] += loss_value
+                    else:
+                        all_aux_losses[loss_name] = loss_value
         
-        # Apply final LayerNorm
+        # Apply final layer normalization
         hidden_states = self.norm(hidden_states)
         
-        return hidden_states, presents
+        return hidden_states, present_key_values, all_aux_losses
 
 
 class CondorForCausalLM(nn.Module):
     """
     Condor model for causal language modeling.
     """
+    
     def __init__(self, config):
         super().__init__()
         self.config = config
-        
-        # Base model
         self.model = CondorModel(config)
-        
-        # LM head
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         
-        # Tie weights of token embeddings and LM head
+        # Tie weights between embedding and lm_head
         self.lm_head.weight = self.model.embed_tokens.weight
     
     @classmethod
     def from_pretrained(cls, model_path: str, config=None) -> "CondorForCausalLM":
         """
-        Load a model from a pretrained checkpoint.
+        Load a pretrained model.
         
-        In a real implementation, this would load weights from files.
-        Here we just create a model with the configuration.
+        Args:
+            model_path: Path to the pretrained model directory
+            config: Model configuration (optional)
+            
+        Returns:
+            Loaded model
         """
+        # Load configuration if not provided
         if config is None:
-            if os.path.isdir(model_path):
-                config = CondorConfig.from_pretrained(model_path)
-            else:
-                # Default to 40B config
-                config = CondorConfig.condor_40b_config()
+            config = CondorConfig.from_pretrained(model_path)
         
+        # Create model with configuration
         model = cls(config)
         
-        # In a real implementation, load weights here
-        # model.load_state_dict(torch.load(os.path.join(model_path, "pytorch_model.bin")))
+        # Load weights if they exist
+        checkpoint_path = os.path.join(model_path, "pytorch_model.bin")
+        if os.path.exists(checkpoint_path):
+            state_dict = torch.load(checkpoint_path, map_location="cpu")
+            model.load_state_dict(state_dict)
         
         return model
     
@@ -409,16 +480,28 @@ class CondorForCausalLM(nn.Module):
     ) -> Dict[str, any]:
         """
         Prepare inputs for generation.
+        
+        Args:
+            input_ids: Input token IDs
+            past_key_values: Past key/value states for attention
+            attention_mask: Attention mask
+            
+        Returns:
+            Dictionary of prepared inputs
         """
-        # Only keep the last token for generation
+        # Only keep the last token for inference if past_key_values are provided
         if past_key_values is not None:
             input_ids = input_ids[:, -1].unsqueeze(-1)
+            
+            # Update attention mask for the new token
+            if attention_mask is not None:
+                attention_mask = attention_mask[:, -1].unsqueeze(-1)
         
         return {
             "input_ids": input_ids,
-            "past_key_values": past_key_values,
-            "use_cache": True,
             "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+            "use_cache": kwargs.get("use_cache", True)
         }
     
     def forward(
@@ -429,35 +512,60 @@ class CondorForCausalLM(nn.Module):
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         labels: Optional[torch.Tensor] = None,
         use_cache: bool = False,
+        training: bool = False,
     ) -> Tuple[torch.Tensor, ...]:
         """
         Forward pass for causal language modeling.
+        
+        Args:
+            input_ids: Input token IDs
+            attention_mask: Attention mask
+            position_ids: Position IDs
+            past_key_values: Past key/value states for attention
+            labels: Labels for computing the masked language modeling loss
+            use_cache: Whether to use cache for incremental decoding
+            
+        Returns:
+            Tuple containing:
+                - logits: Output logits
+                - past_key_values: Updated key/value states (if use_cache=True)
+                - loss: Language modeling loss (if labels are provided)
         """
-        # Get transformer outputs
-        transformer_outputs = self.model(
+        # Get hidden states from the model
+        outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
+            training=training,
         )
         
-        hidden_states = transformer_outputs[0]
+        hidden_states, present_key_values, aux_losses = outputs
         
-        # Apply LM head to get logits
-        lm_logits = self.lm_head(hidden_states)
+        # Project hidden states to vocabulary
+        logits = self.lm_head(hidden_states)
         
         loss = None
+        # Calculate language modeling loss if labels are provided
         if labels is not None:
             # Shift logits and labels for next token prediction
-            shift_logits = lm_logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
             
-            # Compute loss
+            # Flatten the tokens
             loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
+            loss = loss_fct(
+                shift_logits.view(-1, self.config.vocab_size),
+                shift_labels.view(-1)
+            )
+            
+            # Add auxiliary losses if any
+            if aux_losses:
+                for loss_name, aux_loss in aux_losses.items():
+                    loss = loss + aux_loss
         
-        return (loss, lm_logits, transformer_outputs[1]) if loss is not None else (lm_logits, transformer_outputs[1])
+        return (loss, logits, present_key_values) if loss is not None else (logits, present_key_values)
     
     def generate(
         self,
@@ -474,77 +582,104 @@ class CondorForCausalLM(nn.Module):
         """
         Generate text using the model.
         
-        This is a simplified implementation of text generation with Condor model.
+        Args:
+            input_ids: Input token IDs
+            attention_mask: Attention mask
+            max_length: Maximum length of generated sequence
+            temperature: Sampling temperature
+            do_sample: Whether to sample or use greedy decoding
+            top_k: Top k sampling parameter
+            top_p: Top p sampling parameter
+            repetition_penalty: Penalty for repeating tokens
+            num_return_sequences: Number of sequences to return
+            
+        Returns:
+            Generated token IDs
         """
-        # Ensure batch size is at least 1
-        batch_size = input_ids.shape[0]
+        # Ensure input_ids is on the correct device
+        input_ids = input_ids.to(self.lm_head.weight.device)
         
-        # Expand input tensors for multiple return sequences
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(input_ids.device)
+        
+        # Set generation parameters
+        batch_size = input_ids.shape[0]
+        cur_len = input_ids.shape[1]
+        
+        # Expand input_ids for num_return_sequences
         if num_return_sequences > 1:
             input_ids = input_ids.repeat(num_return_sequences, 1)
             if attention_mask is not None:
                 attention_mask = attention_mask.repeat(num_return_sequences, 1)
-            batch_size = batch_size * num_return_sequences
+            batch_size *= num_return_sequences
         
-        # Initialize generated sequences with input_ids
-        generated_tokens = input_ids.clone()
-        
-        # Create attention mask if not provided
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids)
-        
-        # Track past key values for faster generation
+        # Initialize past key values
         past_key_values = None
         
-        # Generation loop
-        for _ in range(max_length - input_ids.shape[1]):
+        # Initialize token tracking for repetition penalty
+        prev_tokens = input_ids.clone()
+        
+        # Loop until max_length or EOS token
+        while cur_len < max_length:
             # Prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(
-                generated_tokens,
+                input_ids=input_ids,
                 past_key_values=past_key_values,
                 attention_mask=attention_mask,
+                use_cache=True
             )
             
-            # Forward pass to get logits
-            outputs = self.forward(**model_inputs)
-            logits = outputs[0] if isinstance(outputs, tuple) else outputs
-            past_key_values = outputs[1] if isinstance(outputs, tuple) and len(outputs) > 1 else None
+            # Forward pass
+            outputs = self(
+                **model_inputs,
+                training=False,
+            )
             
-            # Get the logits for the next token
+            # Get logits and updated past key values
+            if isinstance(outputs, tuple) and len(outputs) >= 2:
+                logits, past_key_values = outputs[:2]
+            else:
+                logits = outputs
+                past_key_values = None
+            
+            # Get logits for the next token
             next_token_logits = logits[:, -1, :]
             
             # Apply temperature
-            next_token_logits = next_token_logits / temperature
+            if temperature != 1.0:
+                next_token_logits = next_token_logits / temperature
             
             # Apply repetition penalty
             if repetition_penalty != 1.0:
-                for batch_idx in range(batch_size):
-                    for token_idx in set(generated_tokens[batch_idx].tolist()):
-                        next_token_logits[batch_idx, token_idx] /= repetition_penalty
+                for i in range(batch_size):
+                    for token_id in set(prev_tokens[i].tolist()):
+                        if token_id in next_token_logits[i]:
+                            next_token_logits[i, token_id] /= repetition_penalty
             
-            # Apply sampling
+            # Set scores for some unwanted tokens to -inf
+            # For example, you might want to disable generation of special tokens or padding
+            
+            # Sample from the distribution or take the argmax
             if do_sample:
-                # Apply top-k filtering
+                # Top-k sampling
                 if top_k > 0:
-                    indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][:, -1, None]
-                    next_token_logits.masked_fill_(indices_to_remove, -float("Inf"))
+                    top_k_logits, top_k_indices = torch.topk(next_token_logits, top_k)
+                    next_token_logits.fill_(float("-inf"))
+                    next_token_logits.scatter_(1, top_k_indices, top_k_logits)
                 
-                # Apply top-p (nucleus) filtering
+                # Top-p sampling
                 if top_p < 1.0:
                     sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
                     cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
                     
                     # Remove tokens with cumulative probability above the threshold
                     sorted_indices_to_remove = cumulative_probs > top_p
-                    # Shift the indices to the right to keep also the first token above the threshold
-                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    # Keep the first token above the threshold
                     sorted_indices_to_remove[..., 0] = 0
                     
-                    # Scatter sorted tensors to original indexing
-                    indices_to_remove = sorted_indices_to_remove.scatter(
-                        dim=1, index=sorted_indices, src=sorted_indices_to_remove
-                    )
-                    next_token_logits.masked_fill_(indices_to_remove, -float("Inf"))
+                    for i in range(batch_size):
+                        indices_to_remove = sorted_indices[i][sorted_indices_to_remove[i]]
+                        next_token_logits[i, indices_to_remove] = float("-inf")
                 
                 # Convert logits to probabilities
                 probs = F.softmax(next_token_logits, dim=-1)
@@ -555,19 +690,32 @@ class CondorForCausalLM(nn.Module):
                 # Greedy decoding
                 next_tokens = torch.argmax(next_token_logits, dim=-1)
             
-            # Append new tokens to the sequence
-            generated_tokens = torch.cat([generated_tokens, next_tokens.unsqueeze(-1)], dim=-1)
+            # Add the next tokens to the generated sequence
+            input_ids = torch.cat([input_ids, next_tokens.unsqueeze(-1)], dim=-1)
             
-            # Update attention mask for new token
-            attention_mask = torch.cat(
-                [attention_mask, torch.ones((batch_size, 1), device=attention_mask.device)], dim=-1
-            )
+            # Update attention mask if necessary
+            if attention_mask is not None:
+                attention_mask = torch.cat(
+                    [attention_mask, attention_mask.new_ones((batch_size, 1))], dim=-1
+                )
+            
+            # Update prev_tokens for repetition penalty
+            prev_tokens = torch.cat([prev_tokens, next_tokens.unsqueeze(-1)], dim=-1)
+            
+            # Update current length
+            cur_len += 1
         
-        return generated_tokens
+        return input_ids
 
 
-# Create a function to easily load the model
 def AutoModelForCausalLM_from_pretrained(model_name_or_path: str, **kwargs) -> CondorForCausalLM:
-    """Helper function to load a model with the given name or path."""
-    config = CondorConfig.from_pretrained(model_name_or_path)
-    return CondorForCausalLM.from_pretrained(model_name_or_path, config=config, **kwargs) 
+    """
+    Helper function to load a pretrained model.
+    
+    Args:
+        model_name_or_path: Path to the pretrained model directory
+        
+    Returns:
+        Loaded model
+    """
+    return CondorForCausalLM.from_pretrained(model_name_or_path, **kwargs) 
