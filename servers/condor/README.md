@@ -1,96 +1,139 @@
-# Condor LLM Server
+# Condor LLM
 
-This directory contains the implementation of a local Condor LLM (Large Language Model) server with the complete model source included in the repository. The server exposes an API endpoint compatible with the OpenAI chat completions format.
+Condor is an open-source large language model with OpenAI-compatible API endpoints built on transformer architecture. It provides high-quality text generation capabilities with support for both standard and Mixture of Experts (MoE) architectures.
 
 ## Features
 
-- Contains the complete Condor model implementation code
-- Self-contained model without external dependencies on Hugging Face
-- FastAPI-based REST API with OpenAI-compatible endpoints
+- Standard and Mixture of Experts (MoE) variants
+- Support for 7B and 40B parameter sizes
+- OpenAI-compatible API endpoints
 - Docker containerization with GPU support
-- Configurable via environment variables
+- Benchmarking tools for performance and accuracy evaluation
 
-## Requirements
+## Configuration
 
-- NVIDIA GPU with at least 40GB VRAM (for 40B model)
-- Docker and Docker Compose
-- NVIDIA Container Toolkit for GPU support
+The model can be configured using environment variables:
 
-## Directory Structure
+- `CONDOR_MODEL_SIZE`: Model size to use (`7b` or `40b`, default: `40b`)
+- `CONDOR_USE_MOE`: Whether to use the Mixture of Experts variant (`0` or `1`, default: `0`)
+- `CONDOR_PORT`: Port for the server (default: `8001`)
+- `CONDOR_HOST`: Host for the server (default: `0.0.0.0`)
+- `CONDOR_MAX_LENGTH`: Maximum token length for generated responses (default: `2048`)
+- `CONDOR_TEMPERATURE`: Sampling temperature (default: `0.7`)
+- `CONDOR_LOG_LEVEL`: Logging level (default: `INFO`)
+- `CONDOR_LOG_DIR`: Directory for log files (default: `logs`)
 
-- `model/`: Contains the Condor model implementation code
-  - `modeling_condor.py`: Core model architecture
-  - `configuration_condor.py`: Model configuration
-  - `tokenizer_condor.py`: Tokenizer implementation
-  - `weights/`: Directory for model weights
-- `server.py`: FastAPI server implementation
-- `Dockerfile`: Docker configuration for the server
-- `docker-compose.yml`: Docker Compose configuration
-- `requirements.txt`: Python dependencies
+## Mixture of Experts (MoE) Architecture
 
-## Environment Variables
+The Condor model supports a Mixture of Experts architecture which can significantly improve model accuracy while maintaining computational efficiency. The MoE implementation includes:
 
-The server can be configured using the following environment variables:
+### 1. MoE Design
 
-- `CONDOR_PORT`: Port for the server (default: 8001)
-- `CONDOR_HOST`: Host to bind the server (default: "0.0.0.0")
-- `CONDOR_MAX_LENGTH`: Maximum token length for generation (default: 2048)
-- `CONDOR_TEMPERATURE`: Sampling temperature (default: 0.7)
+Condor's MoE design replaces standard feed-forward layers with expert-based layers where:
 
-## Quick Start
+- Each token is routed to a subset of experts based on the token's content
+- Experts specialize in different aspects of language understanding
+- The model dynamically selects the most relevant experts for each token
+- Weights from multiple experts are combined to produce the final output
 
-1. Build and start the Docker container:
+### 2. Router Types
+
+Condor supports two types of routing mechanisms:
+
+- **Top-K Router**: Uses learned routing based on token content to select the top-k experts for each token
+- **Hash Router**: Uses a deterministic hash-based approach for expert assignment
+
+### 3. Load Balancing
+
+To ensure efficient usage of experts, the implementation includes:
+
+- Z-loss to prevent the router from assigning all tokens to a single expert
+- Load balancing loss to encourage even distribution of tokens across experts
+- Expert dropout for improved generalization
+
+### 4. Performance Benefits
+
+MoE configurations provide several advantages:
+
+- **Higher accuracy**: Experts can specialize in different types of content
+- **Better parameter efficiency**: More parameters without increasing compute
+- **Improved scaling**: Can scale to larger models with lower inference costs
+
+## Using the Models
+
+### Standard Model
 
 ```bash
-docker-compose up -d
+export CONDOR_MODEL_SIZE=7b
+export CONDOR_USE_MOE=0
+docker-compose up
 ```
 
-2. Check if the server is running properly:
+### MoE Model
 
 ```bash
-curl http://localhost:8001/health
+export CONDOR_MODEL_SIZE=7b
+export CONDOR_USE_MOE=1
+docker-compose up
 ```
 
-## API Usage
+## API Endpoints
 
 ### Chat Completions
 
-You can use the server with the following API endpoint:
-
-```bash
-curl -X POST http://localhost:8001/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [
-      {"role": "system", "content": "You are a helpful AI assistant."},
-      {"role": "user", "content": "Tell me about the Condor AI model."}
-    ],
-    "temperature": 0.7,
-    "max_tokens": 1024
-  }'
+```
+POST /v1/chat/completions
 ```
 
-## Integration with Koritsu
+Request body:
 
-To integrate the Condor server with the main Koritsu framework, update the `config.py` file to add support for the Condor model. This will allow the framework to use Condor alongside other LLM providers.
-
-## Troubleshooting
-
-- If you encounter CUDA out-of-memory errors, try reducing the context length or batch size
-- Adjust the `CONDOR_MAX_LENGTH` environment variable to limit token generation if needed
-- Check the container logs for detailed error messages:
-
-```bash
-docker logs condor-server
+```json
+{
+  "messages": [
+    { "role": "system", "content": "You are a helpful assistant." },
+    { "role": "user", "content": "Hello, who are you?" }
+  ],
+  "temperature": 0.7,
+  "max_tokens": 100
+}
 ```
 
-## Model Information
+### Health Check
 
-The included Condor model is:
+```
+GET /health
+```
 
-- Based on the Condor architecture developed by the Technology Innovation Institute (TII)
-- Built as a transformer-based decoder-only language model
-- Optimized for inference performance in this implementation
-- Open-source under the Apache 2.0 license
+### Model Information
 
-For more information, visit: [Condor-40B on Hugging Face](https://huggingface.co/tiiuae/condor-40b-instruct)
+```
+GET /model/info
+```
+
+## Benchmarking
+
+A benchmarking framework is provided to evaluate and compare different Condor variants:
+
+```bash
+cd servers/condor
+python benchmark/benchmark.py --model-sizes 7b --output benchmark/results/comparison.json
+```
+
+Options:
+
+- `--model-sizes`: Model sizes to benchmark (`7b`, `40b`)
+- `--no-baseline`: Skip benchmarking the standard model
+- `--no-moe`: Skip benchmarking the MoE model
+- `--cpu`: Force using CPU even if CUDA is available
+- `--output`: Output file path for benchmark results
+
+## Docker Setup
+
+Build and run the Docker container:
+
+```bash
+docker-compose build
+docker-compose up
+```
+
+For GPU support, ensure you have the NVIDIA Container Toolkit installed.
